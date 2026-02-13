@@ -123,6 +123,7 @@ elif settings.llm_provider == "litellm":
         base_url=settings.litellm_base_url,
         llm_model=settings.litellm_llm_model,
         embedding_model=settings.litellm_embedding_model,
+        proxy_url=settings.proxy_url,
     )
 else:  # Default to OpenRouter
     client_manager = OpenRouterClientManager(
@@ -369,6 +370,7 @@ async def register(request: RegisterRequest):
                 base_url=settings.litellm_base_url,
                 llm_model=settings.litellm_llm_model,
                 embedding_model=settings.litellm_embedding_model,
+                proxy_url=settings.proxy_url,
             )
             is_valid, error = await client.verify_api_key()
             await client.close()

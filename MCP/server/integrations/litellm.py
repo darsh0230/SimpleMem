@@ -46,7 +46,53 @@ class LiteLLMClient:
 
         if proxy_url:
             try:
-                http_client = httpx.AsyncClient(proxy=proxy_url, timeout=timeout)
+                # Check if proxy_url is a JSON string (for OUTGOING_HTTP_PROXY format)
+                if proxy_url.strip().startswith("{"):
+                    try:
+                        import json
+
+                        proxy_config = json.loads(proxy_url)
+                        print(
+                            f"DEBUG: Parsed proxy config: {proxy_config}"
+                        )  # Debug logging
+
+                        mounts = {}
+                        # Handle http:// and https:// prefixes or keys without protocol
+                        http_proxy = proxy_config.get("http://") or proxy_config.get(
+                            "http"
+                        )
+                        https_proxy = proxy_config.get("https://") or proxy_config.get(
+                            "https"
+                        )
+
+                        if http_proxy:
+                            mounts["http://"] = httpx.AsyncHTTPTransport(
+                                proxy=http_proxy
+                            )
+
+                        if https_proxy:
+                            mounts["https://"] = httpx.AsyncHTTPTransport(
+                                proxy=https_proxy
+                            )
+
+                        if mounts:
+                            http_client = httpx.AsyncClient(
+                                mounts=mounts, timeout=timeout
+                            )
+                        else:
+                            # Fallback if JSON parsed but no valid keys found
+                            http_client = httpx.AsyncClient(
+                                proxy=proxy_url, timeout=timeout
+                            )
+
+                    except json.JSONDecodeError:
+                        # Fallback to simple string if JSON parse fails
+                        http_client = httpx.AsyncClient(
+                            proxy=proxy_url, timeout=timeout
+                        )
+                else:
+                    http_client = httpx.AsyncClient(proxy=proxy_url, timeout=timeout)
+
                 client_kwargs["http_client"] = http_client
             except Exception as e:
                 print(f"Warning: Could not configure proxy: {e}")

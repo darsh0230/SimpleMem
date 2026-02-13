@@ -117,6 +117,13 @@ class Settings:
         )
     )
 
+    # Proxy Configuration
+    proxy_url: Optional[str] = field(
+        default_factory=lambda: os.getenv("OUTGOING_HTTP_PROXY")
+        or os.getenv("HTTPS_PROXY")
+        or os.getenv("HTTP_PROXY")
+    )
+
     # Memory Building Configuration
     window_size: int = 20
     overlap_size: int = 2
