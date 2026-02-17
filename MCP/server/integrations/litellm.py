@@ -9,6 +9,7 @@ import json
 import re
 import hashlib
 from typing import List, Dict, Any, Optional, AsyncIterator
+from ..utils.profile import profiler
 
 import httpx
 from openai import AsyncOpenAI
@@ -111,6 +112,7 @@ class LiteLLMClient:
         max_tokens: Optional[int] = None,
         response_format: Optional[Dict] = None,
         stream: bool = False,
+        model: Optional[str] = None,
     ) -> str:
         """
         Call LLM for chat completion.
@@ -121,12 +123,10 @@ class LiteLLMClient:
             max_tokens: Maximum tokens in response
             response_format: Optional response format (e.g., {"type": "json_object"})
             stream: Whether to stream the response (ignored, use chat_completion_stream)
-
-        Returns:
-            Generated text content
+            model: Optional model override
         """
         request_params: Dict[str, Any] = {
-            "model": self.llm_model,
+            "model": model or self.llm_model,
             "messages": messages,
             "temperature": temperature,
             "stream": False,
@@ -138,8 +138,19 @@ class LiteLLMClient:
         if response_format:
             request_params["response_format"] = response_format
 
-        response = await self.client.chat.completions.create(**request_params)
-        return response.choices[0].message.content or ""
+        # Calculate approximate token count for args
+        prompt_len = sum(len(m.get("content", "")) for m in messages)
+
+        with profiler.profile(
+            "llm_chat_completion",
+            args={
+                "model": self.llm_model,
+                "prompt_len": prompt_len,
+                "temperature": temperature,
+            },
+        ):
+            response = await self.client.chat.completions.create(**request_params)
+            return response.choices[0].message.content or ""
 
     async def chat_completion_stream(
         self,

@@ -13,6 +13,7 @@ from .database.vector_store import MultiTenantVectorStore
 from .core.memory_builder import MemoryBuilder
 from .core.retriever import Retriever
 from .core.answer_generator import AnswerGenerator
+from .utils.profile import profiler
 
 # Type alias for client manager (supports both OpenRouter and Ollama)
 ClientManager = (
@@ -490,35 +491,53 @@ Use to check if memories are being stored correctly.""",
         )
 
     async def _tool_memory_query(self, args: dict) -> dict:
-        retriever = self._get_retriever()
-        generator = self._get_answer_generator()
+        # Configure profiler based on settings
+        if hasattr(self.settings, "enable_profiling"):
+            profiler.set_enabled(self.settings.enable_profiling)
 
-        # Parse agents string
-        agents_str = args.get("agents")
-        agents_list = self._parse_agents(agents_str) if agents_str else None
+        if getattr(self.settings, "enable_profiling", False):
+            profiler.clear()  # Clear previous trace events
 
-        contexts = await retriever.retrieve(
-            query=args["question"],
-            agents=agents_list,
-            enable_reflection=args.get("enable_reflection", True),
-        )
+        try:
+            with profiler.profile("memory_query"):
+                retriever = self._get_retriever()
+                generator = self._get_answer_generator()
 
-        answer_result = await generator.generate_answer(
-            query=args["question"],
-            contexts=contexts,
-        )
+                # Parse agents string
+                agents_str = args.get("agents")
+                agents_list = self._parse_agents(agents_str) if agents_str else None
 
-        # Extract sources only from contexts that were actually used
-        used_indices = answer_result.get("used_context_indices", [])
-        sources = []
-        if used_indices:
-            sources = list(
-                set(
-                    contexts[i].source
-                    for i in used_indices
-                    if i < len(contexts) and contexts[i].source is not None
+                with profiler.profile("retrieve"):
+                    contexts = await retriever.retrieve(
+                        query=args["question"],
+                        agents=agents_list,
+                        enable_reflection=args.get("enable_reflection", True),
+                    )
+
+                with profiler.profile("generate_answer"):
+                    answer_result = await generator.generate_answer(
+                        query=args["question"],
+                        contexts=contexts,
+                    )
+
+                # Extract sources only from contexts that were actually used
+                used_indices = answer_result.get("used_context_indices", [])
+                sources = []
+                if used_indices:
+                    sources = list(
+                        set(
+                            contexts[i].source
+                            for i in used_indices
+                            if i < len(contexts) and contexts[i].source is not None
+                        )
+                    )
+        finally:
+            # Dump trace to a file in /tmp or workspace if enabled
+            if getattr(self.settings, "enable_profiling", False):
+                trace_path = getattr(
+                    self.settings, "profile_path", "/tmp/simplemem_trace.json"
                 )
-            )
+                profiler.dump_trace(trace_path)
 
         return {
             "question": args["question"],

@@ -222,7 +222,8 @@ simplemem-mcp/
 │   ├── auth/                # Authentication modules
 │   ├── core/                # Core memory logic
 │   ├── database/            # Database interfaces
-│   └── integrations/        # LLM provider integrations
+│   ├── integrations/        # LLM provider integrations
+│   └── utils/               # Utility functions
 ├── config/
 │   └── settings.py          # Configuration management
 ├── setup.py                 # Package setup

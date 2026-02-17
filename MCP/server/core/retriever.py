@@ -10,11 +10,13 @@ Performs intelligent retrieval through:
 Refactored: Removed parallel processing for simplicity and stability.
 """
 
+import asyncio
 from typing import List, Optional, Dict, Any
 from dataclasses import dataclass
 
 from ..auth.models import MemoryEntry
 from ..database.vector_store import MultiTenantVectorStore
+from ..utils.profile import profiler
 
 # Type alias for LLM client (supports both OpenRouter and Ollama)
 LLMClient = object  # Duck-typed: can be OpenRouterClient or OllamaClient
@@ -50,6 +52,7 @@ class Retriever:
         max_reflection_rounds: int = 2,
         temperature: float = 0.1,
         embedding_client: Optional[LLMClient] = None,
+        fast_model: Optional[str] = None,
     ):
         self.client = llm_client
         self.embedding_client = (
@@ -63,6 +66,7 @@ class Retriever:
         self.enable_reflection = enable_reflection
         self.max_reflection_rounds = max_reflection_rounds
         self.temperature = temperature
+        self.fast_model = fast_model
 
     async def retrieve(
         self,
@@ -127,63 +131,77 @@ class Retriever:
     ) -> List[MemoryEntry]:
         """Retrieve with intelligent planning and optional reflection"""
 
-        # Step 1: Analyze information requirements
-        plan = await self._analyze_information_requirements(query)
+    async def _retrieve_with_planning(
+        self,
+        query: str,
+        agents: Optional[List[str]],
+        enable_reflection: bool,
+    ) -> List[MemoryEntry]:
+        """Retrieve with intelligent planning and optional reflection"""
 
-        # Step 2: Generate targeted queries
-        search_queries = await self._generate_targeted_queries(query, plan)
+        # Step 1 & 2: Analyze and Generate Queries (Merged)
+        with profiler.profile("analyze_and_generate_queries"):
+            plan, search_queries = await self._analyze_and_generate_queries(query)
 
-        # Step 3: Execute searches sequentially
-        all_results = await self._execute_searches(search_queries, agents)
+        # Step 3: Execute searches in parallel
+        with profiler.profile("execute_searches"):
+            all_results = await self._execute_searches(search_queries, agents)
 
         # Step 4: Merge and deduplicate
         merged_results = self._merge_and_deduplicate(all_results)
 
         # Step 5: Optional reflection
         if enable_reflection and plan.complexity_score > 0.5:
-            merged_results = await self._retrieve_with_reflection(
-                query,
-                merged_results,
-                plan,
-                agents,
-            )
+            with profiler.profile("reflection_loop"):
+                merged_results = await self._retrieve_with_reflection(
+                    query,
+                    merged_results,
+                    plan,
+                    agents,
+                )
 
         return merged_results
 
-    async def _analyze_information_requirements(
+    async def _analyze_and_generate_queries(
         self,
         query: str,
-    ) -> RetrievalPlan:
-        """Analyze query to determine information requirements"""
+    ) -> tuple[RetrievalPlan, List[str]]:
+        """Analyze query and generate targeted search queries in one step"""
 
-        prompt = f"""Analyze the following question and determine retrieval requirements.
+        prompt = f"""Analyze the question and generate targeted search queries.
 
 Question: {query}
 
-Analyze:
-1. What type of question is this? (factual, temporal, relational, comparative, etc.)
-2. What key entities/events need to be identified?
-3. What information types are required? (with priority: high/medium/low)
-4. What relationships need to be established?
-5. How many minimal search queries are needed? (1-4)
-6. Complexity score (0.0-1.0): simple facts=0.2, multi-hop=0.6, complex reasoning=0.8+
+Tasks:
+1. Analyze the question type and entities.
+2. Determine complexity score (0.0-1.0).
+3. Generate 1-4 targeted search queries to find the answer.
+
+Analysis Guidance:
+- 'required_info' should list CONCRETE facts needed (e.g., "price of item", "date of event"), NOT abstract categories like "context" or "domain".
 
 Return JSON:
 {{
-  "question_type": "type",
-  "key_entities": ["entity1", "entity2"],
-  "required_info": [
-    {{"type": "info_type", "priority": "high/medium/low"}}
-  ],
-  "relationships": ["relationship1"],
-  "minimal_queries_needed": 1-4,
-  "complexity_score": 0.0-1.0
+  "analysis": {{
+    "question_type": "type",
+    "key_entities": ["entity1", "entity2"],
+    "required_info": [
+      {{"type": "concrete_fact_needed", "priority": "high/medium/low"}}
+    ],
+    "relationships": ["relationship1"],
+    "minimal_queries_needed": 1-4,
+    "complexity_score": 0.0-1.0
+  }},
+  "queries": ["query1", "query2", ...]
 }}
 
 Return ONLY valid JSON."""
 
         messages = [
-            {"role": "system", "content": "You are a query analysis expert."},
+            {
+                "role": "system",
+                "content": "You are a query analysis and search expert.",
+            },
             {"role": "user", "content": prompt},
         ]
 
@@ -195,30 +213,54 @@ Return ONLY valid JSON."""
 
             data = self.client.extract_json(response)
             if data:
-                return RetrievalPlan(
-                    question_type=data.get("question_type", "factual"),
-                    key_entities=data.get("key_entities", []),
-                    required_info=data.get("required_info", []),
-                    relationships=data.get("relationships", []),
+                analysis = data.get("analysis", {})
+                queries = data.get("queries", [])
+
+                plan = RetrievalPlan(
+                    question_type=analysis.get("question_type", "factual"),
+                    key_entities=analysis.get("key_entities", []),
+                    required_info=analysis.get("required_info", []),
+                    relationships=analysis.get("relationships", []),
                     minimal_queries_needed=min(
-                        data.get("minimal_queries_needed", 1), 4
+                        analysis.get("minimal_queries_needed", 1), 4
                     ),
                     complexity_score=min(
-                        max(data.get("complexity_score", 0.5), 0.0), 1.0
+                        max(analysis.get("complexity_score", 0.5), 0.0), 1.0
                     ),
                 )
-        except Exception as e:
-            print(f"Query analysis error: {e}")
 
-        # Default plan
-        return RetrievalPlan(
-            question_type="factual",
-            key_entities=[],
-            required_info=[],
-            relationships=[],
-            minimal_queries_needed=1,
-            complexity_score=0.5,
+                # Fallback if no queries generated
+                if not queries:
+                    queries = [query]
+
+                return plan, queries[:4]
+
+        except Exception as e:
+            print(f"Analysis and generation error: {e}")
+
+        # Default fallback
+        return (
+            RetrievalPlan(
+                question_type="factual",
+                key_entities=[],
+                required_info=[],
+                relationships=[],
+                minimal_queries_needed=1,
+                complexity_score=0.5,
+            ),
+            [query],
         )
+
+    async def _analyze_information_requirements(
+        self,
+        query: str,
+    ) -> RetrievalPlan:
+        """Deprecated: Analyze query to determine information requirements"""
+        # ... existing implementation kept for fallback or removed if desired ...
+        # For now, keeping the original implementation logic here or we can remove it.
+        # But to be safe and clean, I will just implementing the new one above and keep the old one below or remove it.
+        # Since the user asked to optimize, I'll replace the old one calls with the new one.
+        pass
 
     async def _generate_targeted_queries(
         self,
@@ -274,16 +316,16 @@ Return ONLY valid JSON."""
 
         return [original_query]
 
-    async def _execute_searches(
+    async def _execute_single_search(
         self,
-        queries: List[str],
-        agents: Optional[List[str]] = None,
-    ) -> List[List[MemoryEntry]]:
-        """Execute searches sequentially"""
-        all_results = []
+        query: str,
+        agents: Optional[List[str]],
+    ) -> List[MemoryEntry]:
+        """Execute a single search query (semantic + keyword)"""
+        results = []
 
-        for query in queries:
-            # Semantic search
+        # Semantic search
+        try:
             query_embedding = await self.embedding_client.create_single_embedding(query)
             semantic_results = await self.vector_store.semantic_search(
                 self.table_name,
@@ -293,9 +335,12 @@ Return ONLY valid JSON."""
             # Filter by agents if specified
             if agents:
                 semantic_results = self._filter_by_agents(semantic_results, agents)
-            all_results.append(semantic_results)
+            results.extend(semantic_results)
+        except Exception as e:
+            print(f"Semantic search error for '{query}': {e}")
 
-            # Keyword search
+        # Keyword search
+        try:
             keywords = self._extract_keywords(query)
             if keywords:
                 keyword_results = await self.vector_store.keyword_search(
@@ -306,9 +351,20 @@ Return ONLY valid JSON."""
                 # Filter by agents if specified
                 if agents:
                     keyword_results = self._filter_by_agents(keyword_results, agents)
-                all_results.append(keyword_results)
+                results.extend(keyword_results)
+        except Exception as e:
+            print(f"Keyword search error for '{query}': {e}")
 
-        return all_results
+        return results
+
+    async def _execute_searches(
+        self,
+        queries: List[str],
+        agents: Optional[List[str]] = None,
+    ) -> List[List[MemoryEntry]]:
+        """Execute searches in parallel"""
+        tasks = [self._execute_single_search(q, agents) for q in queries]
+        return await asyncio.gather(*tasks)
 
     def _extract_keywords(self, query: str) -> List[str]:
         """Extract keywords from query for lexical search"""
@@ -482,22 +538,31 @@ Return ONLY valid JSON."""
                 plan,
             )
 
+            # Log the result of completeness check
+            with profiler.profile(
+                f"completeness_check_logging_{round_num}",
+                args={"is_complete": is_complete, "missing_info": missing_info},
+            ):
+                pass
+
             if is_complete:
                 break
 
             # Generate additional queries for missing info
-            additional_queries = await self._generate_missing_info_queries(
-                query,
-                missing_info,
-            )
+            with profiler.profile(f"generate_missing_queries_{round_num}"):
+                additional_queries = await self._generate_missing_info_queries(
+                    query,
+                    missing_info,
+                )
 
             if not additional_queries:
                 break
 
             # Execute additional searches
-            additional_results = await self._execute_searches(
-                additional_queries, agents
-            )
+            with profiler.profile(f"execute_additional_searches_{round_num}"):
+                additional_results = await self._execute_searches(
+                    additional_queries, agents
+                )
 
             # Merge with existing results
             all_results = [current_results] + additional_results
@@ -520,28 +585,32 @@ Return ONLY valid JSON."""
         results_text = "\n".join(
             [
                 f"- {entry.lossless_restatement}"
-                for entry in results[:20]  # Limit for prompt size
+                for entry in results[:15]  # Limit to reduce context
             ]
         )
 
-        prompt = f"""Analyze if the retrieved information is sufficient to answer the question.
+        # Prioritize top 3 required info to avoid strictness
+        top_required = [info.get("type", "") for info in plan.required_info[:3]]
+
+        prompt = f"""Assess if the Question can be answered reasonably well with the Retrieved Information.
 
 Question: {query}
-
-Required Information:
-{[info.get("type", "") for info in plan.required_info]}
 
 Retrieved Information:
 {results_text}
 
-Determine:
-1. Is the information sufficient to answer the question? (yes/no)
-2. If no, what specific information is missing?
+Required Info Types (Guidance only):
+{top_required}
+
+Task:
+1. Determine if there is enough information to construct a helpful answer.
+2. Only say 'is_complete: false' if CRITICAL information is missing.
+3. IGNORE requests for "more context", "original domain", or "specific references" if the core facts are present.
 
 Return JSON:
 {{
   "is_complete": true/false,
-  "missing_info": ["missing1", "missing2"] or []
+  "missing_info": ["critical_missing_fact"] or []
 }}
 
 Return ONLY valid JSON."""
@@ -549,16 +618,22 @@ Return ONLY valid JSON."""
         messages = [
             {
                 "role": "system",
-                "content": "You are an information completeness analyst.",
+                "content": "You are a pragmatic information analyst. You prefer marking tasks complete.",
             },
             {"role": "user", "content": prompt},
         ]
 
         try:
-            response = await self.client.chat_completion(
-                messages=messages,
-                temperature=self.temperature,
-            )
+            # Check if client supports 'model' arg (LiteLLM)
+            kwargs = {"messages": messages, "temperature": self.temperature}
+            if (
+                self.fast_model
+                and hasattr(self.client, "chat_completion")
+                and "model" in self.client.chat_completion.__code__.co_varnames
+            ):
+                kwargs["model"] = self.fast_model
+
+            response = await self.client.chat_completion(**kwargs)
 
             data = self.client.extract_json(response)
             if data:

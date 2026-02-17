@@ -5,6 +5,7 @@ OpenRouter SDK integration for LLM and Embedding services
 import json
 import re
 from typing import List, Dict, Any, Optional, AsyncGenerator
+from ..utils.profile import profiler
 
 
 class OpenRouterClient:
@@ -32,6 +33,7 @@ class OpenRouterClient:
         """Get or create the HTTP client"""
         if self._client is None:
             import httpx
+
             self._client = httpx.AsyncClient(
                 base_url=self.base_url,
                 headers={
@@ -85,14 +87,25 @@ class OpenRouterClient:
         if response_format:
             payload["response_format"] = response_format
 
-        if stream:
-            return await self._stream_completion(payload)
+        # Calculate approximate token count for args
+        prompt_len = sum(len(m.get("content", "")) for m in messages)
 
-        response = await client.post("/chat/completions", json=payload)
-        response.raise_for_status()
-        data = response.json()
+        with profiler.profile(
+            "llm_chat_completion",
+            args={
+                "model": self.llm_model,
+                "prompt_len": prompt_len,
+                "temperature": temperature,
+            },
+        ):
+            if stream:
+                return await self._stream_completion(payload)
 
-        return data["choices"][0]["message"]["content"]
+            response = await client.post("/chat/completions", json=payload)
+            response.raise_for_status()
+            data = response.json()
+
+            return data["choices"][0]["message"]["content"]
 
     async def _stream_completion(self, payload: Dict) -> str:
         """Stream chat completion and return full content"""
@@ -160,7 +173,10 @@ class OpenRouterClient:
         """
         # Check key format first - OpenRouter keys start with sk-or-
         if not self.api_key or not self.api_key.startswith("sk-or-"):
-            return False, "Invalid key format. OpenRouter API keys start with 'sk-or-'. Get yours at openrouter.ai/keys"
+            return (
+                False,
+                "Invalid key format. OpenRouter API keys start with 'sk-or-'. Get yours at openrouter.ai/keys",
+            )
 
         try:
             client = self._get_client()
@@ -249,7 +265,9 @@ class OpenRouterClient:
 
         return None
 
-    def _extract_balanced_braces(self, text: str, open_char: str, close_char: str) -> Optional[str]:
+    def _extract_balanced_braces(
+        self, text: str, open_char: str, close_char: str
+    ) -> Optional[str]:
         """Extract a balanced brace-enclosed string"""
         if not text or text[0] != open_char:
             return None
@@ -296,7 +314,7 @@ class OpenRouterClient:
         cleaned = text.strip()
         for prefix in prefixes:
             if cleaned.lower().startswith(prefix.lower()):
-                cleaned = cleaned[len(prefix):].strip()
+                cleaned = cleaned[len(prefix) :].strip()
 
         # Remove trailing commas before } or ]
         cleaned = re.sub(r",\s*([\}\]])", r"\1", cleaned)
@@ -336,6 +354,7 @@ class OpenRouterClientManager:
         """
         # Use hash of API key as cache key for security
         import hashlib
+
         key_hash = hashlib.sha256(api_key.encode()).hexdigest()[:16]
 
         if key_hash not in self._clients:
@@ -357,6 +376,7 @@ class OpenRouterClientManager:
     async def remove_client(self, api_key: str):
         """Remove and close a specific client"""
         import hashlib
+
         key_hash = hashlib.sha256(api_key.encode()).hexdigest()[:16]
 
         if key_hash in self._clients:

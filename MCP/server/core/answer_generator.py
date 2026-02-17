@@ -7,6 +7,7 @@ Synthesizes answers from retrieved memory contexts using LLM.
 from typing import List, Optional
 
 from ..auth.models import MemoryEntry
+from ..utils.profile import profiler
 
 # Type alias for LLM client (supports both OpenRouter and Ollama)
 LLMClient = object  # Duck-typed: can be OpenRouterClient or OllamaClient
@@ -69,11 +70,12 @@ class AnswerGenerator:
         max_retries = 3
         for attempt in range(max_retries):
             try:
-                response = await self.client.chat_completion(
-                    messages=messages,
-                    temperature=self.temperature,
-                    response_format={"type": "json_object"},
-                )
+                with profiler.profile(f"llm_generate_answer_attempt_{attempt}"):
+                    response = await self.client.chat_completion(
+                        messages=messages,
+                        temperature=self.temperature,
+                        response_format={"type": "json_object"},
+                    )
 
                 data = self.client.extract_json(response)
                 if data:

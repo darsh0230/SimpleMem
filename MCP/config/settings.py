@@ -89,6 +89,11 @@ class Settings:
     litellm_llm_model: str = field(
         default_factory=lambda: os.getenv("LITELLM_MODEL", "open-large")
     )
+    litellm_fast_model: str = field(
+        default_factory=lambda: os.getenv(
+            "LITELLM_FAST_MODEL", os.getenv("LITELLM_MODEL", "open-large")
+        )
+    )
     litellm_embedding_model: str = field(
         default_factory=lambda: os.getenv(
             "LITELLM_EMBEDDING_MODEL", "text-embedding-3-small"
@@ -139,6 +144,10 @@ class Settings:
     llm_temperature: float = 0.1
     llm_max_retries: int = 3
     use_streaming: bool = True
+
+    # Profiling Configuration
+    enable_profiling: bool = False
+    profile_path: str = "/tmp/simplemem_trace.json"
 
     def __post_init__(self):
         """Ensure directories exist"""
