@@ -62,6 +62,18 @@ class RegisterResponse(BaseModel):
     error: Optional[str] = None
 
 
+class RotateKeyRequest(BaseModel):
+    openrouter_api_key: Optional[str] = None
+    litellm_api_key: Optional[str] = None
+    embedding_api_key: Optional[str] = None
+
+
+class RotateKeyResponse(BaseModel):
+    success: bool
+    token: Optional[str] = None  # Fresh JWT with same user_id / table_name
+    error: Optional[str] = None
+
+
 # === Session Management ===
 
 
@@ -494,6 +506,135 @@ async def refresh_token(token: str = Query(..., description="Token to refresh"))
         "success": True,
         "token": new_token,
     }
+
+
+@app.post("/api/auth/rotate-key", response_model=RotateKeyResponse)
+async def rotate_key(
+    request: RotateKeyRequest,
+    authorization: Optional[str] = Header(None),
+):
+    """
+    Rotate API key(s) for the authenticated user.
+
+    The caller must supply a valid Bearer token and at least one new key.
+    Keys are validated against the configured provider before being saved.
+    All active in-memory MCP sessions for this user are invalidated so
+    subsequent requests use the new credentials.
+    A fresh JWT (same user_id / table_name, new expiry) is returned.
+    """
+    try:
+        # --- Authenticate ---
+        user, _llm_key, _emb_key = await verify_bearer_token(authorization)
+
+        # --- Require at least one new key ---
+        if not any(
+            [
+                request.openrouter_api_key,
+                request.litellm_api_key,
+                request.embedding_api_key,
+            ]
+        ):
+            return RotateKeyResponse(
+                success=False,
+                error="At least one key (openrouter_api_key, litellm_api_key, or embedding_api_key) must be provided.",
+            )
+
+        # --- Validate new keys against provider ---
+        if settings.llm_provider == "litellm" and request.litellm_api_key:
+            client = LiteLLMClient(
+                api_key=request.litellm_api_key,
+                base_url=settings.litellm_base_url,
+                llm_model=settings.litellm_llm_model,
+                embedding_model=settings.litellm_embedding_model,
+                proxy_url=settings.proxy_url,
+            )
+            is_valid, error = await client.verify_api_key()
+            await client.close()
+            if not is_valid:
+                return RotateKeyResponse(
+                    success=False,
+                    error=f"Invalid LiteLLM API key: {error}",
+                )
+
+        elif settings.llm_provider == "ollama":
+            # Ollama doesn't use a user-supplied key — just verify connectivity.
+            client = OllamaClient(base_url=settings.ollama_base_url)
+            is_valid, error = await client.verify_api_key()
+            await client.close()
+            if not is_valid:
+                return RotateKeyResponse(
+                    success=False,
+                    error=f"Cannot connect to Ollama: {error}",
+                )
+
+        elif (
+            settings.llm_provider not in ("litellm", "ollama")
+            and request.openrouter_api_key
+        ):
+            # OpenRouter (default)
+            client = OpenRouterClient(
+                api_key=request.openrouter_api_key,
+                base_url=settings.openrouter_base_url,
+            )
+            is_valid, error = await client.verify_api_key()
+            await client.close()
+            if not is_valid:
+                return RotateKeyResponse(
+                    success=False,
+                    error=f"Invalid OpenRouter API key: {error}",
+                )
+
+        # --- Encrypt and persist new key(s) ---
+        new_openrouter_enc = (
+            token_manager.encrypt_api_key(request.openrouter_api_key)
+            if request.openrouter_api_key
+            else None
+        )
+        new_litellm_enc = (
+            token_manager.encrypt_api_key(request.litellm_api_key)
+            if request.litellm_api_key
+            else None
+        )
+        new_embedding_enc = (
+            token_manager.encrypt_api_key(request.embedding_api_key)
+            if request.embedding_api_key
+            else None
+        )
+
+        updated = user_store.update_api_keys(
+            user_id=user.user_id,
+            openrouter_api_key_encrypted=new_openrouter_enc,
+            litellm_api_key_encrypted=new_litellm_enc,
+            embedding_api_key_encrypted=new_embedding_enc,
+        )
+        if not updated:
+            return RotateKeyResponse(success=False, error="User not found in database.")
+
+        # --- Invalidate active in-memory sessions for this user ---
+        async with _session_lock:
+            stale_sessions = [
+                sid
+                for sid, session in _sessions.items()
+                if session.user_id == user.user_id
+            ]
+            for sid in stale_sessions:
+                del _sessions[sid]
+        if stale_sessions:
+            print(
+                f"Invalidated {len(stale_sessions)} session(s) for user {user.user_id} after key rotation."
+            )
+
+        # --- Issue a fresh JWT ---
+        # Re-fetch the user so the token reflects any updated timestamps.
+        updated_user = user_store.get_user(user.user_id)
+        new_token = token_manager.generate_token(updated_user)
+
+        return RotateKeyResponse(success=True, token=new_token)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        return RotateKeyResponse(success=False, error=str(e))
 
 
 # === Health & Info ===

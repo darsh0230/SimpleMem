@@ -44,6 +44,13 @@ class UserStore:
                 )
             except sqlite3.OperationalError:
                 pass  # Column already exists
+            # Migration: Add embedding_api_key_encrypted column if it doesn't exist
+            try:
+                conn.execute(
+                    "ALTER TABLE users ADD COLUMN embedding_api_key_encrypted TEXT NOT NULL DEFAULT ''"
+                )
+            except sqlite3.OperationalError:
+                pass  # Column already exists
             conn.commit()
 
     @contextmanager
@@ -92,6 +99,9 @@ class UserStore:
                     litellm_api_key_encrypted=row["litellm_api_key_encrypted"]
                     if "litellm_api_key_encrypted" in row.keys()
                     else "",
+                    embedding_api_key_encrypted=row["embedding_api_key_encrypted"]
+                    if "embedding_api_key_encrypted" in row.keys()
+                    else "",
                     table_name=row["table_name"],
                     created_at=datetime.fromisoformat(row["created_at"]),
                     last_active=datetime.fromisoformat(row["last_active"]),
@@ -113,6 +123,9 @@ class UserStore:
                     or "",
                     litellm_api_key_encrypted=row["litellm_api_key_encrypted"]
                     if "litellm_api_key_encrypted" in row.keys()
+                    else "",
+                    embedding_api_key_encrypted=row["embedding_api_key_encrypted"]
+                    if "embedding_api_key_encrypted" in row.keys()
                     else "",
                     table_name=row["table_name"],
                     created_at=datetime.fromisoformat(row["created_at"]),
@@ -137,6 +150,58 @@ class UserStore:
                 (encrypted_api_key, datetime.utcnow().isoformat(), user_id),
             )
             conn.commit()
+
+    def update_api_keys(
+        self,
+        user_id: str,
+        openrouter_api_key_encrypted: Optional[str] = None,
+        litellm_api_key_encrypted: Optional[str] = None,
+        embedding_api_key_encrypted: Optional[str] = None,
+    ) -> bool:
+        """
+        Update one or more of the user's encrypted API keys.
+
+        Only the columns for which a non-None value is supplied are touched.
+        Returns True if the user was found and updated, False otherwise.
+        """
+        updates = []
+        params = []
+
+        if openrouter_api_key_encrypted is not None:
+            updates.append("openrouter_api_key_encrypted = ?")
+            params.append(openrouter_api_key_encrypted)
+
+        if litellm_api_key_encrypted is not None:
+            updates.append("litellm_api_key_encrypted = ?")
+            params.append(litellm_api_key_encrypted)
+
+        if embedding_api_key_encrypted is not None:
+            # embedding_api_key_encrypted is a newer column; add it via migration if needed
+            updates.append("embedding_api_key_encrypted = ?")
+            params.append(embedding_api_key_encrypted)
+
+        if not updates:
+            return False
+
+        updates.append("last_active = ?")
+        params.append(datetime.utcnow().isoformat())
+        params.append(user_id)
+
+        sql = f"UPDATE users SET {', '.join(updates)} WHERE user_id = ?"
+
+        with self._get_connection() as conn:
+            # Ensure the embedding_api_key_encrypted column exists (migration guard)
+            if embedding_api_key_encrypted is not None:
+                try:
+                    conn.execute(
+                        "ALTER TABLE users ADD COLUMN embedding_api_key_encrypted TEXT NOT NULL DEFAULT ''"
+                    )
+                except sqlite3.OperationalError:
+                    pass  # Column already exists
+
+            cursor = conn.execute(sql, params)
+            conn.commit()
+            return cursor.rowcount > 0
 
     def delete_user(self, user_id: str) -> bool:
         """Delete a user"""
