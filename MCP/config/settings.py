@@ -40,7 +40,9 @@ class Settings:
         )
     )
     jwt_algorithm: str = "HS256"
-    jwt_expiration_days: int = 30
+    jwt_expiration_days: int = field(
+        default_factory=lambda: int(os.getenv("SIMPLEMEM_JWT_EXPIRATION_DAYS", "30"))
+    )
 
     # Encryption for API Keys
     encryption_key: str = field(

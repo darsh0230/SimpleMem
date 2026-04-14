@@ -493,7 +493,7 @@ async def verify_token(token: str = Query(..., description="Token to verify")):
 @app.post("/api/auth/refresh")
 async def refresh_token(token: str = Query(..., description="Token to refresh")):
     """Refresh authentication token"""
-    is_valid, payload, error = token_manager.verify_token(token)
+    is_valid, payload, error = token_manager.verify_token(token, verify_exp=False)
     if not is_valid:
         raise HTTPException(status_code=401, detail=error)
 

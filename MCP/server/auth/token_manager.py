@@ -56,7 +56,7 @@ class TokenManager:
             algorithm=self.algorithm,
         )
 
-    def verify_token(self, token: str) -> Tuple[bool, Optional[TokenPayload], Optional[str]]:
+    def verify_token(self, token: str, verify_exp: bool = True) -> Tuple[bool, Optional[TokenPayload], Optional[str]]:
         """
         Verify a JWT token
 
@@ -68,6 +68,7 @@ class TokenManager:
                 token,
                 self.secret_key,
                 algorithms=[self.algorithm],
+                options={"verify_exp": verify_exp}
             )
             payload = TokenPayload.from_dict(decoded)
             return True, payload, None
@@ -84,7 +85,7 @@ class TokenManager:
         Returns:
             Tuple of (new_token, error_message)
         """
-        is_valid, payload, error = self.verify_token(token)
+        is_valid, payload, error = self.verify_token(token, verify_exp=False)
         if not is_valid:
             return None, error
 
